@@ -1,495 +1,1378 @@
-linux-monitoring/
-│
-├── bin/
-│   ├── monitor.sh
-│   ├── service-monitor.sh
-│   ├── health-check.sh
-│   └── continuous-monitor.sh
-│
-├── config/
-│   └── config.conf
-│
-├── logs/
-│   └── system.log
-│
-├── start-monitor.sh
-└── README.md
-
-nano filename.sh
-
-
 #!/bin/bash
 
-# ============================================================
-# Linux Server Monitoring System
-# Version: 1.0
-# ============================================================
+mkdir -p linux_health_dashboard
+cd linux_health_dashboard
+# ==========================================================
+# Linux Health Monitoring Dashboard
+# Bash-only monitoring system
+# ==========================================================
 
-set -u
+PORT=8080
+HOST="0.0.0.0"
+REFRESH=5
 
-# -----------------------------
-# Configuration
-# -----------------------------
-
-LOG_DIR="$HOME/linux-monitoring/logs"
-LOG_FILE="$LOG_DIR/system.log"
-
-CPU_WARNING=70
-CPU_CRITICAL=90
-
-MEMORY_WARNING=70
-MEMORY_CRITICAL=90
-
-DISK_WARNING=70
-DISK_CRITICAL=90
-
-mkdir -p "$LOG_DIR"
-
-# -----------------------------
+# ----------------------------------------------------------
 # Colors
-# -----------------------------
+# ----------------------------------------------------------
 
+GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
-GREEN='\033[0;32m'
-BLUE='\033[0;34m'
 NC='\033[0m'
 
-# -----------------------------
-# Get CPU Usage
-# -----------------------------
+# ----------------------------------------------------------
+# Check root
+# ----------------------------------------------------------
+
+if [ "$EUID" -ne 0 ]; then
+    echo "Please run this script as root."
+    echo "Example: sudo bash health-dashboard.sh"
+    exit 1
+fi
+
+# ----------------------------------------------------------
+# Required commands
+# ----------------------------------------------------------
+
+COMMANDS=(
+    "awk"
+    "sed"
+    "grep"
+    "df"
+    "free"
+    "uptime"
+    "hostname"
+    "uname"
+    "systemctl"
+)
+
+for command in "${COMMANDS[@]}"; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+        echo "ERROR: $command is not installed."
+        exit 1
+    fi
+done
+
+# ----------------------------------------------------------
+# Temporary directory
+# ----------------------------------------------------------
+
+WORK_DIR="/tmp/linux-health-dashboard"
+
+mkdir -p "$WORK_DIR"
+
+HTML_FILE="$WORK_DIR/index.html"
+
+# ----------------------------------------------------------
+# CPU Usage
+# ----------------------------------------------------------
 
 get_cpu_usage() {
-    CPU_USAGE=$(top -bn1 | awk '/Cpu\(s\)/ {
-        print 100 - $8
-    }')
 
-    printf "%.0f" "$CPU_USAGE"
+    read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+
+    total1=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    idle1=$((idle + iowait))
+
+    sleep 1
+
+    read cpu user nice system idle iowait irq softirq steal guest guest_nice < /proc/stat
+
+    total2=$((user + nice + system + idle + iowait + irq + softirq + steal))
+    idle2=$((idle + iowait))
+
+    total_diff=$((total2 - total1))
+    idle_diff=$((idle2 - idle1))
+
+    if [ "$total_diff" -eq 0 ]; then
+        echo "0"
+    else
+        echo $((100 * (total_diff - idle_diff) / total_diff))
+    fi
 }
 
-# -----------------------------
-# Get Memory Usage
-# -----------------------------
+# ----------------------------------------------------------
+# Memory Usage
+# ----------------------------------------------------------
 
 get_memory_usage() {
-    free | awk '/Mem:/ {
-        printf "%.0f", ($3 / $2) * 100
-    }'
+
+    total=$(awk '/MemTotal/ {print $2}' /proc/meminfo)
+    available=$(awk '/MemAvailable/ {print $2}' /proc/meminfo)
+
+    used=$((total - available))
+
+    if [ "$total" -gt 0 ]; then
+        echo $((used * 100 / total))
+    else
+        echo "0"
+    fi
 }
 
-# -----------------------------
-# Get Disk Usage
-# -----------------------------
+# ----------------------------------------------------------
+# Disk Usage
+# ----------------------------------------------------------
 
 get_disk_usage() {
-    df -P / | awk 'NR==2 {
-        gsub("%", "", $5)
-        print $5
-    }'
+
+    df -P / | awk 'NR==2 {gsub("%","",$5); print $5}'
 }
 
-# -----------------------------
-# Get Load Average
-# -----------------------------
+# ----------------------------------------------------------
+# Disk Free Space
+# ----------------------------------------------------------
+
+get_disk_free() {
+
+    df -h / | awk 'NR==2 {print $4}'
+}
+
+# ----------------------------------------------------------
+# Disk Total Space
+# ----------------------------------------------------------
+
+get_disk_total() {
+
+    df -h / | awk 'NR==2 {print $2}'
+}
+
+# ----------------------------------------------------------
+# Disk Used Space
+# ----------------------------------------------------------
+
+get_disk_used() {
+
+    df -h / | awk 'NR==2 {print $3}'
+}
+
+# ----------------------------------------------------------
+# Memory Information
+# ----------------------------------------------------------
+
+get_memory_total() {
+
+    free -h | awk '/Mem:/ {print $2}'
+}
+
+get_memory_used() {
+
+    free -h | awk '/Mem:/ {print $3}'
+}
+
+get_memory_available() {
+
+    free -h | awk '/Mem:/ {print $7}'
+}
+
+# ----------------------------------------------------------
+# Load Average
+# ----------------------------------------------------------
 
 get_load_average() {
-    awk '{print $1, $2, $3}' /proc/loadavg
+
+    awk '{print $1}' /proc/loadavg
 }
 
-# -----------------------------
-# Get Uptime
-# -----------------------------
-
-get_uptime() {
-    uptime -p 2>/dev/null || uptime
-}
-
-# -----------------------------
-# Get Process Count
-# -----------------------------
+# ----------------------------------------------------------
+# Process Count
+# ----------------------------------------------------------
 
 get_process_count() {
-    ps -e --no-headers | wc -l
+
+    ls -d /proc/[0-9]* 2>/dev/null | wc -l
 }
 
-# -----------------------------
-# Get Network RX
-# -----------------------------
+# ----------------------------------------------------------
+# CPU Core Count
+# ----------------------------------------------------------
 
-get_network_rx() {
-    awk '
-    NR > 2 {
-        gsub(":", "", $1)
-        rx += $2
-    }
-    END {
-        print rx
-    }
-    ' /proc/net/dev
+get_cpu_cores() {
+
+    nproc
 }
 
-# -----------------------------
-# Get Network TX
-# -----------------------------
+# ----------------------------------------------------------
+# Uptime
+# ----------------------------------------------------------
 
-get_network_tx() {
-    awk '
-    NR > 2 {
-        gsub(":", "", $1)
-        tx += $10
-    }
-    END {
-        print tx
-    }
-    ' /proc/net/dev
+get_uptime() {
+
+    uptime -p
 }
 
-# -----------------------------
-# Convert Bytes to MB
-# -----------------------------
+# ----------------------------------------------------------
+# Hostname
+# ----------------------------------------------------------
 
-bytes_to_mb() {
-    BYTES="$1"
+get_hostname() {
 
-    awk -v bytes="$BYTES" 'BEGIN {
-        printf "%.2f", bytes / 1024 / 1024
-    }'
+    hostname
 }
 
-# -----------------------------
-# Check Status
-# -----------------------------
+# ----------------------------------------------------------
+# OS Information
+# ----------------------------------------------------------
 
-check_status() {
-    VALUE="$1"
-    WARNING="$2"
-    CRITICAL="$3"
+get_os() {
 
-    if [ "$VALUE" -ge "$CRITICAL" ]; then
-        echo -e "${RED}CRITICAL${NC}"
-    elif [ "$VALUE" -ge "$WARNING" ]; then
-        echo -e "${YELLOW}WARNING${NC}"
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$PRETTY_NAME"
     else
-        echo -e "${GREEN}OK${NC}"
+        echo "Unknown Linux"
     fi
 }
 
-# -----------------------------
-# Check Services
-# -----------------------------
+# ----------------------------------------------------------
+# Kernel
+# ----------------------------------------------------------
 
-check_services() {
+get_kernel() {
 
-    echo
-    echo "--------------------------------------------"
-    echo "SERVICE STATUS"
-    echo "--------------------------------------------"
-
-    SERVICES=("sshd" "docker" "nginx")
-
-    for SERVICE in "${SERVICES[@]}"; do
-
-        if systemctl list-unit-files \
-            | grep -q "^${SERVICE}.service"; then
-
-            if systemctl is-active --quiet "$SERVICE"; then
-                echo -e "$SERVICE : ${GREEN}RUNNING${NC}"
-            else
-                echo -e "$SERVICE : ${RED}STOPPED${NC}"
-            fi
-
-        else
-            echo "$SERVICE : NOT INSTALLED"
-        fi
-
-    done
+    uname -r
 }
 
-# -----------------------------
-# Check Docker
-# -----------------------------
+# ----------------------------------------------------------
+# Architecture
+# ----------------------------------------------------------
 
-check_docker() {
+get_architecture() {
 
-    echo
-    echo "--------------------------------------------"
-    echo "DOCKER STATUS"
-    echo "--------------------------------------------"
+    uname -m
+}
 
-    if command -v docker >/dev/null 2>&1; then
+# ----------------------------------------------------------
+# Network Interface
+# ----------------------------------------------------------
 
-        if systemctl is-active --quiet docker 2>/dev/null; then
+get_interface() {
 
-            CONTAINER_COUNT=$(docker ps -q 2>/dev/null | wc -l)
+    ip route 2>/dev/null |
+        awk '/default/ {print $5; exit}'
+}
 
-            echo -e "Docker       : ${GREEN}RUNNING${NC}"
-            echo "Containers   : $CONTAINER_COUNT"
+# ----------------------------------------------------------
+# Network RX
+# ----------------------------------------------------------
 
-            if [ "$CONTAINER_COUNT" -gt 0 ]; then
-                echo
-                docker ps --format \
-                "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
-            fi
+get_rx() {
 
+    interface=$(get_interface)
+
+    if [ -n "$interface" ] &&
+       [ -f "/sys/class/net/$interface/statistics/rx_bytes" ]; then
+
+        bytes=$(cat "/sys/class/net/$interface/statistics/rx_bytes")
+
+        if [ "$bytes" -ge 1073741824 ]; then
+            awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+        elif [ "$bytes" -ge 1048576 ]; then
+            awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+        elif [ "$bytes" -ge 1024 ]; then
+            awk "BEGIN {printf \"%.2f KB\", $bytes/1024}"
         else
-            echo -e "Docker       : ${RED}STOPPED${NC}"
+            echo "${bytes} B"
         fi
-
     else
-        echo "Docker       : NOT INSTALLED"
+        echo "N/A"
     fi
 }
 
-# -----------------------------
-# Top CPU Processes
-# -----------------------------
+# ----------------------------------------------------------
+# Network TX
+# ----------------------------------------------------------
 
-top_cpu_processes() {
+get_tx() {
 
-    echo
-    echo "--------------------------------------------"
-    echo "TOP CPU PROCESSES"
-    echo "--------------------------------------------"
+    interface=$(get_interface)
 
-    ps -eo pid,user,comm,%cpu,%mem --sort=-%cpu \
-        | head -6
+    if [ -n "$interface" ] &&
+       [ -f "/sys/class/net/$interface/statistics/tx_bytes" ]; then
+
+        bytes=$(cat "/sys/class/net/$interface/statistics/tx_bytes")
+
+        if [ "$bytes" -ge 1073741824 ]; then
+            awk "BEGIN {printf \"%.2f GB\", $bytes/1073741824}"
+        elif [ "$bytes" -ge 1048576 ]; then
+            awk "BEGIN {printf \"%.2f MB\", $bytes/1048576}"
+        elif [ "$bytes" -ge 1024 ]; then
+            awk "BEGIN {printf \"%.2f KB\", $bytes/1024}"
+        else
+            echo "${bytes} B"
+        fi
+    else
+        echo "N/A"
+    fi
 }
 
-# -----------------------------
-# Top Memory Processes
-# -----------------------------
+# ----------------------------------------------------------
+# Service Status
+# ----------------------------------------------------------
 
-top_memory_processes() {
+service_status() {
 
-    echo
-    echo "--------------------------------------------"
-    echo "TOP MEMORY PROCESSES"
-    echo "--------------------------------------------"
+    service="$1"
 
-    ps -eo pid,user,comm,%cpu,%mem --sort=-%mem \
-        | head -6
+    if systemctl list-unit-files |
+        grep -q "^${service}\.service"; then
+
+        if systemctl is-active --quiet "$service"; then
+            echo "RUNNING"
+        else
+            echo "STOPPED"
+        fi
+    else
+        echo "NOT INSTALLED"
+    fi
 }
 
-# -----------------------------
-# Main Monitoring Function
-# -----------------------------
+# ----------------------------------------------------------
+# Status Color
+# ----------------------------------------------------------
 
-monitor_system() {
+status_class() {
 
-    TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
-    HOSTNAME=$(hostname)
+    status="$1"
+
+    case "$status" in
+
+        RUNNING)
+            echo "running"
+            ;;
+
+        STOPPED)
+            echo "stopped"
+            ;;
+
+        *)
+            echo "unknown"
+            ;;
+
+    esac
+}
+
+# ----------------------------------------------------------
+# Generate HTML
+# ----------------------------------------------------------
+
+generate_html() {
 
     CPU=$(get_cpu_usage)
+
     MEMORY=$(get_memory_usage)
+
     DISK=$(get_disk_usage)
+
     LOAD=$(get_load_average)
-    UPTIME=$(get_uptime)
+
     PROCESSES=$(get_process_count)
 
-    RX=$(get_network_rx)
-    TX=$(get_network_tx)
+    CORES=$(get_cpu_cores)
 
-    RX_MB=$(bytes_to_mb "$RX")
-    TX_MB=$(bytes_to_mb "$TX")
+    HOSTNAME=$(get_hostname)
 
-    CPU_STATUS=$(check_status \
-        "$CPU" \
-        "$CPU_WARNING" \
-        "$CPU_CRITICAL")
+    OS=$(get_os)
 
-    MEMORY_STATUS=$(check_status \
-        "$MEMORY" \
-        "$MEMORY_WARNING" \
-        "$MEMORY_CRITICAL")
+    KERNEL=$(get_kernel)
 
-    DISK_STATUS=$(check_status \
-        "$DISK" \
-        "$DISK_WARNING" \
-        "$DISK_CRITICAL")
+    ARCH=$(get_architecture)
 
-    clear
+    UPTIME=$(get_uptime)
 
-    echo "============================================================"
-    echo "              LINUX SERVER MONITORING SYSTEM"
-    echo "============================================================"
+    MEMORY_TOTAL=$(get_memory_total)
 
-    echo
-    echo "Hostname       : $HOSTNAME"
-    echo "Date & Time    : $TIMESTAMP"
-    echo "Uptime         : $UPTIME"
+    MEMORY_USED=$(get_memory_used)
 
-    echo
-    echo "------------------------------------------------------------"
-    echo "SYSTEM RESOURCES"
-    echo "------------------------------------------------------------"
+    MEMORY_AVAILABLE=$(get_memory_available)
 
-    printf "CPU Usage      : %s%%       " "$CPU"
-    echo -e "$CPU_STATUS"
+    DISK_TOTAL=$(get_disk_total)
 
-    printf "Memory Usage   : %s%%       " "$MEMORY"
-    echo -e "$MEMORY_STATUS"
+    DISK_USED=$(get_disk_used)
 
-    printf "Disk Usage     : %s%%       " "$DISK"
-    echo -e "$DISK_STATUS"
+    DISK_FREE=$(get_disk_free)
 
-    echo "Load Average   : $LOAD"
-    echo "Processes      : $PROCESSES"
+    INTERFACE=$(get_interface)
 
-    echo
-    echo "------------------------------------------------------------"
-    echo "NETWORK"
-    echo "------------------------------------------------------------"
+    RX=$(get_rx)
 
-    echo "Network RX     : ${RX_MB} MB"
-    echo "Network TX     : ${TX_MB} MB"
+    TX=$(get_tx)
 
-    check_services
+    SSH_STATUS=$(service_status sshd)
 
-    check_docker
+    NGINX_STATUS=$(service_status nginx)
 
-    top_cpu_processes
+    DOCKER_STATUS=$(service_status docker)
 
-    top_memory_processes
+    JENKINS_STATUS=$(service_status jenkins)
 
-    echo
-    echo "------------------------------------------------------------"
-    echo "LOG"
-    echo "------------------------------------------------------------"
+    SSH_CLASS=$(status_class "$SSH_STATUS")
 
-    echo "Log file       : $LOG_FILE"
+    NGINX_CLASS=$(status_class "$NGINX_STATUS")
 
-    echo
-    echo "============================================================"
+    DOCKER_CLASS=$(status_class "$DOCKER_STATUS")
 
-    # -----------------------------
-    # Write monitoring data to log
-    # -----------------------------
+    JENKINS_CLASS=$(status_class "$JENKINS_STATUS")
 
-    {
-        echo "============================================================"
-        echo "Timestamp      : $TIMESTAMP"
-        echo "Hostname       : $HOSTNAME"
-        echo "CPU Usage      : ${CPU}%"
-        echo "Memory Usage   : ${MEMORY}%"
-        echo "Disk Usage     : ${DISK}%"
-        echo "Load Average   : $LOAD"
-        echo "Uptime         : $UPTIME"
-        echo "Processes      : $PROCESSES"
-        echo "Network RX     : ${RX_MB} MB"
-        echo "Network TX     : ${TX_MB} MB"
-        echo "============================================================"
-        echo
-    } >> "$LOG_FILE"
+cat > "$HTML_FILE" <<EOF
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<meta http-equiv="refresh" content="$REFRESH">
+
+<title>Linux Health Dashboard</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
 }
 
-# -----------------------------
-# Menu
-# -----------------------------
+body {
 
-show_menu() {
+    margin: 0;
 
-    while true; do
+    font-family:
+        Arial,
+        Helvetica,
+        sans-serif;
 
-        echo
-        echo "============================================================"
-        echo "              LINUX MONITORING SYSTEM"
-        echo "============================================================"
-        echo
-        echo "1. Run monitoring once"
-        echo "2. Continuous monitoring"
-        echo "3. Show logs"
-        echo "4. Show system information"
-        echo "5. Exit"
-        echo
+    background:
+        #0b1120;
 
-        read -r -p "Enter your choice: " CHOICE
+    color:
+        #f8fafc;
 
-        case "$CHOICE" in
-
-            1)
-                monitor_system
-                ;;
-
-            2)
-                read -r -p "Enter interval in seconds [10]: " INTERVAL
-
-                if [ -z "$INTERVAL" ]; then
-                    INTERVAL=10
-                fi
-
-                if ! [[ "$INTERVAL" =~ ^[0-9]+$ ]]; then
-                    echo "Invalid interval."
-                    continue
-                fi
-
-                while true; do
-                    monitor_system
-                    echo
-                    echo "Next check in $INTERVAL seconds..."
-                    echo "Press Ctrl+C to stop."
-
-                    sleep "$INTERVAL"
-                done
-                ;;
-
-            3)
-                if [ -f "$LOG_FILE" ]; then
-                    cat "$LOG_FILE"
-                else
-                    echo "No logs available."
-                fi
-                ;;
-
-            4)
-                echo
-                echo "================ SYSTEM INFORMATION ================"
-                echo
-                echo "Hostname:"
-                hostname
-
-                echo
-                echo "Operating System:"
-                if [ -f /etc/os-release ]; then
-                    . /etc/os-release
-                    echo "$PRETTY_NAME"
-                else
-                    uname -s
-                fi
-
-                echo
-                echo "Kernel:"
-                uname -r
-
-                echo
-                echo "Architecture:"
-                uname -m
-
-                echo
-                echo "IP Address:"
-                hostname -I 2>/dev/null || true
-
-                echo
-                echo "===================================================="
-                ;;
-
-            5)
-                echo
-                echo "Exiting Linux Monitoring System."
-                exit 0
-                ;;
-
-            *)
-                echo
-                echo "Invalid choice. Please select 1-5."
-                ;;
-
-        esac
-
-    done
 }
 
-# -----------------------------
-# Start Application
-# -----------------------------
+.container {
 
-show_menu
+    max-width: 1400px;
+
+    margin:
+        auto;
+
+    padding:
+        30px;
+
+}
+
+.header {
+
+    display:
+        flex;
+
+    justify-content:
+        space-between;
+
+    align-items:
+        center;
+
+    margin-bottom:
+        30px;
+
+}
+
+.title h1 {
+
+    margin:
+        0;
+
+    font-size:
+        32px;
+
+}
+
+.title p {
+
+    color:
+        #94a3b8;
+
+    margin-top:
+        8px;
+
+}
+
+.status {
+
+    background:
+        #052e16;
+
+    color:
+        #4ade80;
+
+    padding:
+        10px 18px;
+
+    border-radius:
+        30px;
+
+    font-weight:
+        bold;
+
+}
+
+.grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap:
+        20px;
+
+}
+
+.card {
+
+    background:
+        #111827;
+
+    border:
+        1px solid #1f2937;
+
+    border-radius:
+        16px;
+
+    padding:
+        22px;
+
+    box-shadow:
+        0 10px 30px rgba(0,0,0,.2);
+
+}
+
+.card h3 {
+
+    margin:
+        0;
+
+    color:
+        #94a3b8;
+
+    font-size:
+        14px;
+
+    text-transform:
+        uppercase;
+
+    letter-spacing:
+        1px;
+
+}
+
+.value {
+
+    font-size:
+        34px;
+
+    font-weight:
+        bold;
+
+    margin-top:
+        15px;
+
+}
+
+.progress {
+
+    height:
+        9px;
+
+    background:
+        #1f2937;
+
+    border-radius:
+        10px;
+
+    margin-top:
+        15px;
+
+    overflow:
+        hidden;
+
+}
+
+.progress-bar {
+
+    height:
+        100%;
+
+    background:
+        #22c55e;
+
+    width:
+        ${CPU}%;
+
+}
+
+.memory-bar {
+
+    width:
+        ${MEMORY}%;
+
+}
+
+.disk-bar {
+
+    width:
+        ${DISK}%;
+
+}
+
+.section {
+
+    margin-top:
+        25px;
+
+}
+
+.section-title {
+
+    font-size:
+        20px;
+
+    margin-bottom:
+        15px;
+
+}
+
+.info-grid {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(3, 1fr);
+
+    gap:
+        15px;
+
+}
+
+.info {
+
+    background:
+        #0f172a;
+
+    border:
+        1px solid #1e293b;
+
+    padding:
+        18px;
+
+    border-radius:
+        12px;
+
+}
+
+.info span {
+
+    display:
+        block;
+
+    color:
+        #64748b;
+
+    font-size:
+        13px;
+
+    margin-bottom:
+        6px;
+
+}
+
+.services {
+
+    display:
+        grid;
+
+    grid-template-columns:
+        repeat(4, 1fr);
+
+    gap:
+        15px;
+
+}
+
+.service {
+
+    background:
+        #0f172a;
+
+    border-radius:
+        12px;
+
+    padding:
+        18px;
+
+    border:
+        1px solid #1e293b;
+
+}
+
+.service-name {
+
+    font-weight:
+        bold;
+
+    margin-bottom:
+        12px;
+
+}
+
+.badge {
+
+    display:
+        inline-block;
+
+    padding:
+        6px 10px;
+
+    border-radius:
+        20px;
+
+    font-size:
+        12px;
+
+    font-weight:
+        bold;
+
+}
+
+.running {
+
+    background:
+        #052e16;
+
+    color:
+        #4ade80;
+
+}
+
+.stopped {
+
+    background:
+        #450a0a;
+
+    color:
+        #f87171;
+
+}
+
+.unknown {
+
+    background:
+        #422006;
+
+    color:
+        #fbbf24;
+
+}
+
+.footer {
+
+    text-align:
+        center;
+
+    color:
+        #64748b;
+
+    margin-top:
+        30px;
+
+    padding:
+        20px;
+
+}
+
+@media(max-width: 1000px) {
+
+    .grid {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+
+    }
+
+    .services {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+
+    }
+
+    .info-grid {
+
+        grid-template-columns:
+            repeat(2, 1fr);
+
+    }
+
+}
+
+@media(max-width: 600px) {
+
+    .container {
+
+        padding:
+            15px;
+
+    }
+
+    .header {
+
+        display:
+            block;
+
+    }
+
+    .status {
+
+        display:
+            inline-block;
+
+        margin-top:
+            15px;
+
+    }
+
+    .grid {
+
+        grid-template-columns:
+            1fr;
+
+    }
+
+    .services {
+
+        grid-template-columns:
+            1fr;
+
+    }
+
+    .info-grid {
+
+        grid-template-columns:
+            1fr;
+
+    }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<div class="header">
+
+<div class="title">
+
+<h1>Linux Health Dashboard</h1>
+
+<p>Real-time Linux server monitoring</p>
+
+</div>
+
+<div class="status">
+● SYSTEM ONLINE
+</div>
+
+</div>
+
+
+<!-- ================= SYSTEM METRICS ================= -->
+
+<div class="grid">
+
+
+<div class="card">
+
+<h3>CPU Usage</h3>
+
+<div class="value">
+$CPU%
+</div>
+
+<div class="progress">
+
+<div
+class="progress-bar"
+style="width:${CPU}%">
+</div>
+
+</div>
+
+<p>
+$CORES CPU cores
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Memory Usage</h3>
+
+<div class="value">
+$MEMORY%
+</div>
+
+<div class="progress">
+
+<div
+class="progress-bar memory-bar"
+style="width:${MEMORY}%">
+</div>
+
+</div>
+
+<p>
+Used: $MEMORY_USED / $MEMORY_TOTAL
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Disk Usage</h3>
+
+<div class="value">
+$DISK%
+</div>
+
+<div class="progress">
+
+<div
+class="progress-bar disk-bar"
+style="width:${DISK}%">
+</div>
+
+</div>
+
+<p>
+$DISK_USED used / $DISK_TOTAL
+</p>
+
+</div>
+
+
+<div class="card">
+
+<h3>Load Average</h3>
+
+<div class="value">
+$LOAD
+</div>
+
+<p>
+Running processes: $PROCESSES
+</p>
+
+</div>
+
+
+</div>
+
+
+<!-- ================= SYSTEM INFORMATION ================= -->
+
+<div class="section">
+
+<div class="section-title">
+System Information
+</div>
+
+<div class="info-grid">
+
+
+<div class="info">
+
+<span>Hostname</span>
+
+<strong>
+$HOSTNAME
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Operating System</span>
+
+<strong>
+$OS
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Kernel</span>
+
+<strong>
+$KERNEL
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Architecture</span>
+
+<strong>
+$ARCH
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Uptime</span>
+
+<strong>
+$UPTIME
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>CPU Cores</span>
+
+<strong>
+$CORES
+</strong>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- ================= MEMORY ================= -->
+
+<div class="section">
+
+<div class="section-title">
+Memory Information
+</div>
+
+<div class="info-grid">
+
+
+<div class="info">
+
+<span>Total Memory</span>
+
+<strong>
+$MEMORY_TOTAL
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Used Memory</span>
+
+<strong>
+$MEMORY_USED
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Available Memory</span>
+
+<strong>
+$MEMORY_AVAILABLE
+</strong>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- ================= DISK ================= -->
+
+<div class="section">
+
+<div class="section-title">
+Disk Information
+</div>
+
+<div class="info-grid">
+
+
+<div class="info">
+
+<span>Total Disk</span>
+
+<strong>
+$DISK_TOTAL
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Used Disk</span>
+
+<strong>
+$DISK_USED
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Free Disk</span>
+
+<strong>
+$DISK_FREE
+</strong>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- ================= NETWORK ================= -->
+
+<div class="section">
+
+<div class="section-title">
+Network Information
+</div>
+
+<div class="info-grid">
+
+
+<div class="info">
+
+<span>Interface</span>
+
+<strong>
+$INTERFACE
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Received</span>
+
+<strong>
+$RX
+</strong>
+
+</div>
+
+
+<div class="info">
+
+<span>Transmitted</span>
+
+<strong>
+$TX
+</strong>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<!-- ================= SERVICES ================= -->
+
+<div class="section">
+
+<div class="section-title">
+Service Health
+</div>
+
+<div class="services">
+
+
+<div class="service">
+
+<div class="service-name">
+SSH
+</div>
+
+<span class="badge $SSH_CLASS">
+$SSH_STATUS
+</span>
+
+</div>
+
+
+<div class="service">
+
+<div class="service-name">
+Nginx
+</div>
+
+<span class="badge $NGINX_CLASS">
+$NGINX_STATUS
+</span>
+
+</div>
+
+
+<div class="service">
+
+<div class="service-name">
+Docker
+</div>
+
+<span class="badge $DOCKER_CLASS">
+$DOCKER_STATUS
+</span>
+
+</div>
+
+
+<div class="service">
+
+<div class="service-name">
+Jenkins
+</div>
+
+<span class="badge $JENKINS_CLASS">
+$JENKINS_STATUS
+</span>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<div class="footer">
+
+Linux Health Dashboard
+
+<br>
+
+Automatically refreshed every $REFRESH seconds
+
+</div>
+
+</div>
+
+</body>
+
+</html>
+
+EOF
+
+}
+
+# ----------------------------------------------------------
+# Start dashboard
+# ----------------------------------------------------------
+
+echo
+echo "=================================================="
+echo "       LINUX HEALTH MONITORING DASHBOARD"
+echo "=================================================="
+echo
+echo "Dashboard Port : $PORT"
+echo "Refresh Rate   : $REFRESH seconds"
+echo "Work Directory : $WORK_DIR"
+echo
+echo "Dashboard URL:"
+echo
+echo "http://SERVER-IP:$PORT"
+echo
+echo "Press CTRL+C to stop."
+echo
+echo "=================================================="
+
+# ----------------------------------------------------------
+# Simple HTTP server using Bash
+# ----------------------------------------------------------
+
+while true
+do
+
+    generate_html
+
+    # ------------------------------------------------------
+    # Find available HTTP server
+    # ------------------------------------------------------
+
+    if command -v python3 >/dev/null 2>&1; then
+
+        cd "$WORK_DIR"
+
+        python3 -m http.server "$PORT" \
+            --bind "$HOST"
+
+        break
+
+    elif command -v busybox >/dev/null 2>&1; then
+
+        cd "$WORK_DIR"
+
+        busybox httpd \
+            -f \
+            -p "$PORT"
+
+        break
+
+    else
+
+        echo
+        echo "ERROR:"
+        echo "Python3 or BusyBox is required only"
+        echo "to serve the generated HTML dashboard."
+        echo
+        echo "Install Python3:"
+        echo
+        echo "Amazon Linux:"
+        echo "sudo dnf install python3 -y"
+        echo
+        exit 1
+
+    fi
+
+done
